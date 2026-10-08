@@ -54,20 +54,17 @@ co-mingled with another's.
 
 ## Demo
 
-<!-- TODO: replace the placeholders below with a real recording and screenshots.
-     See "Adding the demo" at the bottom of this file. -->
+A two and a half minute walkthrough of the real product: a student searches in plain
+language, gets ranked faculty with current-work summaries, contacts a lab, browses
+open research positions, and builds out a profile and project portfolio.
 
-**90-second walkthrough:** a student describes what they want to work on, gets ranked
-faculty matches with current-work summaries, and contacts a lab.
+[![Watch the VergeSci demo](docs/demo/poster.png)](docs/demo/vergesci-demo.mp4)
 
-> 🎥 _Demo video coming shortly._
-
-| | |
-|---|---|
-| ![Interest-matched faculty feed](docs/demo/01-discover-labs.png) | **Discover Labs.** Ranked faculty for this student, each card showing a plain-language research summary, current work, and salient tags. |
-| ![Semantic research search](docs/demo/02-align-interests.png) | **Align Interests.** Natural-language search across faculty, labs, and open positions. "I want to work on protein folding with computational methods" returns real people. |
-| ![Ranked opportunities feed](docs/demo/03-opportunities.png) | **Opportunities.** One ranked feed of open research positions, scored against the student's interests, profile, and project history. |
-| ![Lab detail and outreach](docs/demo/04-outreach.png) | **Outreach.** A student contacts a PI with shared context already filled in, so the first message is specific rather than generic. |
+<sub><b>▶ Click the image to play</b> (2:28, no audio). Direct link:
+<a href="docs/demo/vergesci-demo.mp4">docs/demo/vergesci-demo.mp4</a><br>
+Recorded against live production data, so student names and photos are blurred.
+Faculty profiles are public information and are shown as they appear on the
+platform.</sub>
 
 ---
 
@@ -78,7 +75,12 @@ reranked with a cross-encoder and adjusted by observed behavior. Three ingredien
 go in: what the student says, what the faculty actually do, and what the student
 does on the platform.
 
-### 1. The student side
+The architectural decision that matters most here is **where fresh behavior enters
+the pipeline**. We run a two-speed system: a slow, stable student embedding that
+determines the candidate set, and a fast, per-request reranking layer where
+interaction signals actually do their work.
+
+### 1. The student side: a deliberately slow vector
 
 Every student gets a single embedding built from a weighted text representation of
 who they are. The weighting is deliberate, because stated interests and revealed
@@ -98,38 +100,118 @@ interests are not equally informative:
   CV text.
 
 The result is embedded with OpenAI `text-embedding-3-small` into a 1536-dimensional
-vector. It is regenerated asynchronously after every search a student runs, so the
-profile tracks a student whose interests shift over a term instead of freezing at
-whatever they typed during onboarding.
+vector. Critically, **it is not rebuilt on every interaction.** See
+[when to re-embed](#2-when-to-re-embed-and-why-almost-never) below for why that
+would be wasted work.
 
-### 2. The faculty side
+### 2. When to re-embed, and why almost never
+
+The first version of this system regenerated a student's embedding after every
+single search. That is the obvious design, and it is the wrong one.
+
+**The retrieval layer only has to be right about the candidate set, not the order.**
+The student vector's entire job is to pull a pool of plausible faculty out of a
+campus corpus. The cross-encoder then re-sorts that pool from scratch. So the only
+question worth asking about embedding freshness is: *how much new signal does it
+take to change which faculty are in the pool?*
+
+The answer is: far more than one interaction. A student's profile text runs around
+2,000 tokens. One new query line, even at 3x weighting, adds roughly 45 tokens, about
+2% of the total mass. Appending 2% more text to a document leaves the old and new
+embeddings at a cosine similarity above 0.99. Against a campus corpus of one to three
+thousand faculty, with the candidate pool deliberately over-fetched, a perturbation
+that small reshuffles near-ties *inside* the pool and essentially never changes
+membership. We were paying a full profile read, a roughly 7,000-token embedding call,
+and a 6 KB vector write to produce a reordering the reranker was about to discard and
+redo anyway.
+
+So re-embedding is gated on a threshold:
+
+> **Re-embed when the cumulative weight of un-embedded interaction signals reaches
+> 3.0**, with a 24-hour minimum spacing between rebuilds and a 14-day flush for any
+> student carrying pending signal below the threshold.
+
+**Why trigger on weight rather than event count.** The interaction weights (table
+below) already encode how informative each action is. A raw count would let thirty
+profile views at 0.10 each, which is close to noise, force a rebuild, while a single
+sent message at 1.00, the strongest preference signal in the system, would not.
+Weight is the quantity we actually care about, so it is the quantity we threshold on.
+
+**Why 3.0 specifically.** It is the point where the new text becomes large enough to
+move the candidate set rather than just its internal ordering. Three units of weight
+is roughly four searches, or one realistic mixed session: a contact click (0.80), two
+saves (1.00), and three card clicks (0.90). At 3x query weighting that is on the order
+of 120 to 180 tokens of new high-weight text, call it 6 to 9% of profile mass, which
+is where new faculty genuinely start entering the top-k. Below that we are buying
+noise; above it we are leaving real drift on the table.
+
+It also maps onto a natural human unit. Three units of weight is about **one engaged
+browsing session**, so a student's slow vector updates roughly once per session
+instead of fifteen times within one. That drops re-embeds from O(searches) to
+O(sessions), a five to tenfold reduction for an active user, and the cost scales with
+genuine interest change rather than with raw clicking.
+
+**Why the two guardrails.** The 24-hour spacing stops one unusually heavy session
+from triggering repeated rebuilds as it crosses the threshold again and again. The
+14-day flush catches the opposite failure: the light browser who never accumulates
+3.0 but whose interests have still drifted over a term, and who would otherwise be
+served against a vector built during onboarding.
+
+There is a user-facing benefit too, not just a cost one. A feed that re-sorts itself
+after every click feels broken; students lose their place and stop trusting that the
+ranking means anything. Pinning the retrieval layer and letting only the reranker
+move keeps results stable between sessions while staying responsive within one.
+
+### 3. The faculty side
 
 Every faculty member in a campus corpus gets an embedding built from name, title,
 department, areas of research, and an LLM-generated research summary. Faculty who
 match active federal awards also get a grant-enriched embedding (see
 [research freshness](#the-research-freshness-challenge) below).
 
-### 3. Retrieval, then reranking
+### 4. Retrieval, then reranking
 
-1. **Approximate nearest neighbor search.** The student vector is queried against the
-   campus faculty index using MongoDB Atlas Vector Search (HNSW), which returns
-   candidates ranked by **cosine similarity** between the student embedding and each
-   faculty embedding. Open positions and other students are retrieved the same way
-   against their own indexes.
-2. **Cross-encoder rerank.** The top candidates are reranked with Cohere
-   `rerank-v3.5`, scoring the student's actual query text against each candidate's
-   research text jointly. A bi-encoder has to compress a whole research program into
-   one vector before it ever sees the query; a cross-encoder reads both together and
-   is markedly better at the near-miss cases, which is exactly where ranking quality
-   is decided.
-3. **Behavioral adjustment.** Rerank scores are boosted by the student's accumulated
-   interaction signals for each entity.
+**Step one, approximate nearest neighbor search (the slow layer).** The student
+vector is queried against the campus faculty index using MongoDB Atlas Vector Search
+(HNSW), returning candidates ranked by **cosine similarity** between the student
+embedding and each faculty embedding. Open positions and other students are retrieved
+the same way against their own indexes.
 
-### 4. Interaction signals
+We deliberately **over-fetch**, pulling a top-k several times larger than what gets
+displayed. Over-fetching is what makes a slow embedding safe: the right faculty member
+only has to make it *into* the pool, and a stale-by-one-session vector is more than
+good enough for that. Where the pool gets ordered is the next step.
 
-High-signal events are written back to the student's own campus database and feed both
-the embedding and the ranking boost. Weights reflect how much each action actually
-reveals about preference:
+**Step two, signal-informed cross-encoder rerank (the fast layer).** This is where
+interaction signals enter, per request, at zero embedding cost:
+
+1. **The rerank query is built from live signal state.** For an explicit search, it is
+   the student's query text. For the no-query recommended feed, it is synthesized on
+   the spot from the student's most recent queries and the research text of their
+   highest-weight engaged entities. A student who spent last night saving
+   computational-neuroscience labs gets a rerank query that reflects that
+   **immediately**, on the very next request, with no rebuild of anything.
+2. **Cohere `rerank-v3.5` cross-encodes** that query against each candidate's research
+   text. A bi-encoder has to compress a whole research program into one vector before
+   it ever sees the query; a cross-encoder reads both together and is markedly better
+   at the near-miss cases, which is exactly where ranking quality is decided.
+3. **A signal prior adjusts the result.** Each candidate's rerank score is boosted by
+   the student's accumulated weight on that entity, plus an affinity term for
+   candidates similar to entities the student has already engaged with. Signal weights
+   decay exponentially with a roughly 30-day half-life, because a student's interests
+   shift over a term and last semester's clicks should not outvote this week's.
+
+The division of labor is the whole point. **The embedding carries who the student is;
+the reranker carries what they are doing right now.** Fresh behavior reaches the
+ranking on the next request instead of waiting for a rebuild, and the expensive
+operation only runs when the behavior has accumulated enough to change the answer.
+
+### 5. Interaction signals
+
+High-signal events are written back to the student's own campus database. They do
+double duty: they drive the per-request rerank boost described above, and their
+accumulated weight is what trips the re-embedding threshold. Weights reflect how much
+each action actually reveals about preference:
 
 | Signal | Weight |
 |---|---|
@@ -241,13 +323,16 @@ benchmark.
 └─────────────────────────────────┬───────────────────────────────────────┘
                                   │
 ┌─────────────────────────────────▼───────────────────────────────────────┐
-│ 4. RECOMMENDATIONS                                                      │
+│ 4. RECOMMENDATIONS  (two speeds)                                        │
 │                                                                         │
-│    student embedding (queries 3x · engaged labs 2x · profile 1x)        │
-│         │                                                               │
-│         ├─► ANN retrieval, cosine similarity ──► candidate set          │
-│         ├─► cross-encoder rerank (Cohere rerank-v3.5)                   │
-│         └─► interaction-signal boost ──────────► ranked results         │
+│   SLOW ── student embedding (queries 3x · engaged labs 2x · profile 1x) │
+│           rebuilt only when pending signal weight >= 3.0                │
+│                    │                                                    │
+│                    └─► ANN retrieval, cosine ──► over-fetched top-k     │
+│                                                        │                │
+│   FAST ── rerank query from live signals ──────────────┤                │
+│           cross-encoder rerank (Cohere rerank-v3.5) ───┤                │
+│           signal boost + affinity, 30-day half-life ───┴─► ranked       │
 │                                                                         │
 │    Three surfaces: recommended labs · ranked opportunities ·            │
 │                    recommended students (the PI-side reverse match)     │
@@ -367,30 +452,3 @@ who in it might want their help.
 - **Zack Parisi** · [@zack-parisi](https://github.com/zack-parisi)
 
 ---
-
-<details>
-<summary><b>Adding the demo (notes to self)</b></summary>
-
-The demo section above references files that do not exist yet. To finish it:
-
-1. Record a 60 to 90 second screen capture of the student flow: onboarding interests →
-   Discover Labs → Align Interests search → a lab card → contact. Upload it to YouTube
-   or Loom and replace the `🎥 Demo video coming shortly.` line with a thumbnail link:
-
-   ```markdown
-   [![Watch the demo](docs/demo/thumbnail.png)](https://youtu.be/VIDEO_ID)
-   ```
-
-2. Take four screenshots and commit them to `docs/demo/`:
-   - `01-discover-labs.png`
-   - `02-align-interests.png`
-   - `03-opportunities.png`
-   - `04-outreach.png`
-
-   GitHub also accepts images pasted directly into a web edit of this file, which
-   uploads them to its own CDN and may be faster than committing binaries.
-
-3. Scrub any real student names, emails, or profile photos before publishing. Use
-   the sandbox campus (VergeSci University) for clean demo data.
-
-</details>
